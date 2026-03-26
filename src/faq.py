@@ -58,9 +58,10 @@ def _cluster_rows(
     embed_model: str,
     embed_cache: FileCache,
     threshold: float,
+    namespace: str | None = None,
 ) -> List[List[int]]:
     questions = [row["q_clean"] for row in faq_rows]
-    embeddings, _ = embed_texts(questions, client, embed_model, embed_cache)
+    embeddings, _ = embed_texts(questions, client, embed_model, embed_cache, namespace=namespace)
     return split_large_clusters(cluster_embeddings(embeddings, threshold), embeddings)
 
 
@@ -103,6 +104,7 @@ def build_faq_catalogue(
     llm_cache: FileCache,
     embed_model: str,
     embed_cache: FileCache,
+    embed_namespace: str | None = None,
     system_prompt: str = SYSTEM_PROMPT,
     user_template: str = USER_TEMPLATE,
     threshold: float = 0.82,
@@ -127,7 +129,7 @@ def build_faq_catalogue(
     if not faq_rows:
         return []
 
-    clusters = _cluster_rows(faq_rows, client, embed_model, embed_cache, threshold)
+    clusters = _cluster_rows(faq_rows, client, embed_model, embed_cache, threshold, namespace=embed_namespace)
     results: List[Dict[str, Any]] = []
     for idx, cluster in enumerate(clusters):
         cluster_rows = [faq_rows[i] for i in cluster]
@@ -171,3 +173,86 @@ def build_faq_catalogue(
         results.append(_fallback_faq(f"faq_{idx}", variants, answers, freq))
 
     return results
+
+
+def collect_faq_rows(atoms_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    faq_rows: List[Dict[str, Any]] = []
+    for atoms in atoms_rows:
+        convo_id = atoms.get("conversation_id")
+        for candidate in atoms.get("faq_candidates", []) or []:
+            q_clean = (candidate.get("q_clean") or "").strip()
+            if not q_clean:
+                continue
+            faq_rows.append(
+                {
+                    "conversation_id": convo_id,
+                    "q_clean": q_clean,
+                    "q_raw": (candidate.get("q_raw") or "").strip(),
+                    "a_candidates": candidate.get("a_candidates") or [],
+                }
+            )
+    return faq_rows
+
+
+def cluster_faq_rows(
+    faq_rows: List[Dict[str, Any]],
+    client: OpenAI | None,
+    embed_model: str,
+    embed_cache: FileCache,
+    threshold: float,
+    namespace: str | None = None,
+) -> List[List[int]]:
+    if not faq_rows:
+        return []
+    return _cluster_rows(faq_rows, client, embed_model, embed_cache, threshold, namespace=namespace)
+
+
+def build_faq_from_cluster(
+    cluster_rows: List[Dict[str, Any]],
+    client: OpenAI | None,
+    llm_model: str,
+    llm_cache: FileCache,
+    system_prompt: str = SYSTEM_PROMPT,
+    user_template: str = USER_TEMPLATE,
+    faq_id: str | None = None,
+    min_freq: int = 3,
+    force_llm: bool = True,
+) -> Dict[str, Any]:
+    freq = len(cluster_rows)
+    questions = [row["q_clean"] for row in cluster_rows]
+    variants = _dedupe([row["q_raw"] for row in cluster_rows] + questions)
+    answers = _dedupe([ans for row in cluster_rows for ans in (row["a_candidates"] or [])])
+
+    has_impact = _has_high_impact(questions)
+    should_llm = client is not None and (force_llm or freq >= min_freq or has_impact)
+    fallback_id = faq_id or "faq_single"
+
+    if should_llm:
+        variants_json = json.dumps(variants, ensure_ascii=True)
+        answers_json = json.dumps(answers, ensure_ascii=True)
+        prompt = user_template
+        if "{variants}" in prompt:
+            prompt = prompt.replace("{variants}", variants_json)
+        else:
+            prompt = f"{prompt}\n\nQuestion variants:\n{variants_json}"
+        if "{answers}" in prompt:
+            prompt = prompt.replace("{answers}", answers_json)
+        else:
+            prompt = f"{prompt}\n\nAnswer candidates:\n{answers_json}"
+        key = llm_cache.key_for(llm_model, system_prompt, prompt)
+        try:
+            parsed = chat_json_with_cache(
+                client,
+                llm_model,
+                system_prompt,
+                prompt,
+                llm_cache,
+                key,
+            )
+            parsed["faq_id"] = parsed.get("faq_id") or fallback_id
+            entry = FAQEntry.model_validate(parsed)
+            return entry.model_dump(by_alias=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return _fallback_faq(fallback_id, variants, answers, freq)

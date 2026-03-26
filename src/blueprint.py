@@ -1,9 +1,26 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import json
 from typing import Any, Dict, List
 
+from openai import OpenAI
+
 from .models import BlueprintPersona, EscalationPattern, GapItem, PolicySummary, ToneSummary
+from .cache import FileCache
+from .openai_client import chat_json_with_cache
+
+
+SYSTEM_PROMPT = "You are an analyst who produces a business blueprint summary in JSON only."
+USER_TEMPLATE = (
+    "Given the base blueprint and evidence, return JSON only with keys:\n"
+    "tone_summary (list of {tone, count}), policy_summary (list of {policy, count, examples}),\n"
+    "escalation_patterns (list of {pattern, count, examples}), gaps (list of {faq_id, reason}).\n"
+    "Do not add keys. Use the same schema.\n\n"
+    "Base blueprint:\n{base_blueprint}\n\n"
+    "Atoms rows:\n{atoms_rows}\n\n"
+    "FAQ entries:\n{faq_entries}\n"
+)
 
 
 def _top_examples(values: List[str], limit: int = 3) -> List[str]:
@@ -60,3 +77,24 @@ def build_blueprint(atoms_rows: List[Dict[str, Any]], faq_entries: List[Dict[str
         gaps=gaps,
     )
     return blueprint.model_dump()
+
+
+def build_blueprint_with_llm(
+    atoms_rows: List[Dict[str, Any]],
+    faq_entries: List[Dict[str, Any]],
+    client: OpenAI,
+    llm_model: str,
+    llm_cache: FileCache,
+    system_prompt: str = SYSTEM_PROMPT,
+    user_template: str = USER_TEMPLATE,
+) -> Dict[str, Any]:
+    base = build_blueprint(atoms_rows, faq_entries)
+    prompt = user_template
+    prompt = prompt.replace("{base_blueprint}", json.dumps(base, ensure_ascii=True))
+    prompt = prompt.replace("{atoms_rows}", json.dumps(atoms_rows, ensure_ascii=True))
+    prompt = prompt.replace("{faq_entries}", json.dumps(faq_entries, ensure_ascii=True))
+    cache_key = llm_cache.key_for(llm_model, system_prompt, prompt)
+    parsed = chat_json_with_cache(client, llm_model, system_prompt, prompt, llm_cache, cache_key)
+    if isinstance(parsed, dict) and parsed:
+        return parsed
+    return base

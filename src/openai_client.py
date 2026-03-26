@@ -9,12 +9,26 @@ from openai import OpenAI
 from .cache import FileCache
 
 
+def _is_temperature_unsupported(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "temperature" in msg and ("unsupported" in msg or "does not support" in msg)
+
+
 def call_chat(client: OpenAI, model: str, system: str, user: str, temperature: float = 0.0) -> str:
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=temperature,
-    )
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if not _is_temperature_unsupported(exc):
+            raise
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+        )
     return resp.choices[0].message.content or ""
 
 

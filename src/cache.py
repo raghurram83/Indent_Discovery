@@ -29,9 +29,19 @@ class FileCache:
             self.logger.info("cache_miss %s", key)
             return None
         self.logger.info("cache_hit %s", key)
-        return json.loads(path.read_text())
+        try:
+            return json.loads(path.read_text())
+        except json.JSONDecodeError:
+            # Corrupted cache entry; drop it so it can be regenerated.
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            self.logger.info("cache_corrupt %s", key)
+            return None
 
     def set(self, key: str, value: Any) -> None:
         path = self.root / f"{key}.json"
+        ensure_dir(path.parent)
         path.write_text(json.dumps(value, ensure_ascii=True, indent=2))
         self.logger.info("cache_write %s", key)

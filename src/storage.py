@@ -35,6 +35,14 @@ class WorkspacePaths:
         return self.root / "stage_blueprint" / "blueprint.json"
 
     @property
+    def system_prompts_path(self) -> Path:
+        return self.root / "stage_prompts" / "system_prompts.json"
+
+    @property
+    def system_prompt_tests_path(self) -> Path:
+        return self.root / "stage_tests" / "system_prompt_tests.json"
+
+    @property
     def llm_cache_dir(self) -> Path:
         return self.root / "cache" / "llm"
 

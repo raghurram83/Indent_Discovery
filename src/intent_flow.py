@@ -60,9 +60,10 @@ def _cluster_flow_keys(
     embed_model: str,
     embed_cache: FileCache,
     threshold: float,
+    namespace: str | None = None,
 ) -> List[List[int]]:
     keys = [item["flow_key"] for item in flow_items]
-    embeddings, _ = embed_texts(keys, client, embed_model, embed_cache)
+    embeddings, _ = embed_texts(keys, client, embed_model, embed_cache, namespace=namespace)
     return split_large_clusters(cluster_embeddings(embeddings, threshold), embeddings)
 
 
@@ -104,6 +105,145 @@ def _fallback_intent(cluster_items: List[Dict[str, Any]], idx: int) -> Dict[str,
     }
 
 
+def _build_from_clusters(
+    flow_items: List[Dict[str, Any]],
+    clusters: List[List[int]],
+    client: OpenAI | None,
+    llm_model: str,
+    llm_cache: FileCache,
+    min_freq: int,
+    system_prompt: str,
+    user_template: str,
+    max_candidates_per_cluster: int,
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    for idx, cluster in enumerate(clusters):
+        cluster_items = [flow_items[i] for i in cluster]
+        freq = len(cluster_items)
+        intent_text = " ".join(item["intent_candidate"] for item in cluster_items)
+        should_llm = client is not None and (freq >= min_freq or _has_high_impact(intent_text))
+
+        if should_llm and max_candidates_per_cluster > 0:
+            batches = [
+                cluster_items[i : i + max_candidates_per_cluster]
+                for i in range(0, len(cluster_items), max_candidates_per_cluster)
+            ]
+        else:
+            batches = [cluster_items]
+
+        batch_results = []
+        for batch_idx, batch in enumerate(batches):
+            if not should_llm:
+                batch_results.append(_fallback_intent(batch, idx))
+                continue
+            payload = {
+                "cluster_id": f"cluster_{idx}",
+                "cluster_size": freq,
+                "batch_index": batch_idx,
+                "batch_size": len(batch),
+                "flow_candidates": [
+                    {
+                        "intent_candidate": item.get("intent_candidate", ""),
+                        "scenario_candidate": item.get("scenario_candidate", ""),
+                        "flow_steps_candidate": item.get("flow_steps_candidate", []),
+                        "resolution": item.get("resolution", {}),
+                    }
+                    for item in batch
+                ],
+            }
+            candidates_json = json.dumps(payload, ensure_ascii=True)
+            if "{candidates}" in user_template:
+                prompt = user_template.replace("{candidates}", candidates_json)
+            else:
+                prompt = f"{user_template}\n\nFlow candidates:\n{candidates_json}"
+            key = llm_cache.key_for(llm_model, system_prompt, prompt)
+            try:
+                parsed = chat_json_with_cache(client, llm_model, system_prompt, prompt, llm_cache, key)
+                scenarios = parsed.get("scenarios") or []
+                convo_ids = _dedupe([item.get("conversation_id", "") for item in batch])
+                for scenario in scenarios:
+                    scenario.setdefault("frequency", len(batch))
+                    scenario.setdefault("required_inputs", [])
+                    scenario.setdefault("handover_rules", [])
+                    scenario.setdefault("example_conversation_ids", convo_ids[:5])
+                parsed.setdefault("intent_id", f"intent_{idx}_b{batch_idx}")
+                parsed.setdefault(
+                    "intent_confidence",
+                    {"score_0_to_1": 0.0, "reason": "missing_intent_confidence_from_prompt"},
+                )
+                parsed["scenarios"] = scenarios
+                batch_results.append(parsed)
+            except Exception:  # noqa: BLE001
+                batch_results.append(_fallback_intent(batch, idx))
+
+        if len(batch_results) > 1:
+            results.append(_merge_batch_intents(batch_results, idx))
+        else:
+            results.extend(batch_results)
+
+    return results
+
+
+def _merge_batch_intents(batch_results: List[Dict[str, Any]], cluster_idx: int) -> Dict[str, Any]:
+    base = batch_results[0]
+    intent_name = base.get("intent_name") or f"Intent {cluster_idx}"
+    definition = base.get("definition") or ""
+    intent_confidence = base.get("intent_confidence") or {}
+    best_conf = intent_confidence.get("score_0_to_1")
+
+    scenario_map: Dict[str, Dict[str, Any]] = {}
+    for item in batch_results:
+        conf = item.get("intent_confidence") or {}
+        score = conf.get("score_0_to_1")
+        if score is not None and (best_conf is None or score > best_conf):
+            intent_confidence = conf
+            best_conf = score
+        for scenario in item.get("scenarios") or []:
+            name = scenario.get("scenario_name") or "Scenario"
+            key = name.strip().lower()
+            existing = scenario_map.get(key)
+            if not existing:
+                scenario_map[key] = dict(scenario)
+                continue
+            existing["frequency"] = (existing.get("frequency") or 0) + (scenario.get("frequency") or 0)
+            existing_steps = existing.get("flow_template") or []
+            new_steps = scenario.get("flow_template") or []
+            if len(new_steps) > len(existing_steps):
+                existing["flow_template"] = new_steps
+            req = set(existing.get("required_inputs") or [])
+            req.update(scenario.get("required_inputs") or [])
+            existing["required_inputs"] = sorted(req)
+            handover = set(existing.get("handover_rules") or [])
+            handover.update(scenario.get("handover_rules") or [])
+            existing["handover_rules"] = sorted(handover)
+            sc_conf = existing.get("scenario_confidence") or {}
+            new_sc_conf = scenario.get("scenario_confidence") or {}
+            sc_score = sc_conf.get("score_0_to_1")
+            new_score = new_sc_conf.get("score_0_to_1")
+            if new_score is not None and (sc_score is None or new_score > sc_score):
+                existing["scenario_confidence"] = new_sc_conf
+            auto = existing.get("automation_suitability") or {}
+            new_auto = scenario.get("automation_suitability") or {}
+            auto_score = auto.get("score_0_to_1")
+            new_auto_score = new_auto.get("score_0_to_1")
+            if new_auto_score is not None and (auto_score is None or new_auto_score > auto_score):
+                existing["automation_suitability"] = new_auto
+            elif auto.get("suitable") is False and new_auto.get("suitable") is True:
+                existing["automation_suitability"]["suitable"] = True
+            examples = set(existing.get("example_conversation_ids") or [])
+            examples.update(scenario.get("example_conversation_ids") or [])
+            existing["example_conversation_ids"] = list(examples)[:5]
+            scenario_map[key] = existing
+
+    return {
+        "intent_id": f"intent_{cluster_idx}",
+        "intent_name": intent_name,
+        "definition": definition,
+        "intent_confidence": intent_confidence,
+        "scenarios": list(scenario_map.values()),
+    }
+
+
 def build_intent_flow_catalogue(
     atoms_rows: List[Dict[str, Any]],
     client: OpenAI | None,
@@ -111,10 +251,13 @@ def build_intent_flow_catalogue(
     llm_cache: FileCache,
     embed_model: str,
     embed_cache: FileCache,
+    embed_namespace: str | None = None,
+    cluster_on_intent_only: bool = True,
     system_prompt: str = SYSTEM_PROMPT,
     user_template: str = USER_TEMPLATE,
     threshold: float = 0.82,
     min_freq: int = 3,
+    max_candidates_per_cluster: int = 25,
 ) -> List[Dict[str, Any]]:
     flow_items: List[Dict[str, Any]] = []
     for atoms in atoms_rows:
@@ -131,65 +274,48 @@ def build_intent_flow_catalogue(
                     "scenario_candidate": scenario,
                     "flow_steps_candidate": candidate.get("flow_steps_candidate") or [],
                     "resolution": candidate.get("resolution") or {},
-                    "flow_key": f"{intent} | {scenario}".strip(" |"),
+                    "flow_key": intent if cluster_on_intent_only else f"{intent} | {scenario}".strip(" |"),
                 }
             )
 
     if not flow_items:
         return []
 
-    clusters = _cluster_flow_keys(flow_items, client, embed_model, embed_cache, threshold)
-    results: List[Dict[str, Any]] = []
-    for idx, cluster in enumerate(clusters):
-        cluster_items = [flow_items[i] for i in cluster]
-        freq = len(cluster_items)
-        intent_text = " ".join(item["intent_candidate"] for item in cluster_items)
-        should_llm = client is not None and (freq >= min_freq or _has_high_impact(intent_text))
+    clusters = _cluster_flow_keys(flow_items, client, embed_model, embed_cache, threshold, namespace=embed_namespace)
+    return _build_from_clusters(
+        flow_items,
+        clusters,
+        client,
+        llm_model,
+        llm_cache,
+        min_freq,
+        system_prompt,
+        user_template,
+        max_candidates_per_cluster,
+    )
 
-        if should_llm:
-            payload = {
-                "cluster_id": f"cluster_{idx}",
-                "cluster_size": freq,
-                "flow_candidates": [
-                    {
-                        "intent_candidate": item.get("intent_candidate", ""),
-                        "scenario_candidate": item.get("scenario_candidate", ""),
-                        "flow_steps_candidate": item.get("flow_steps_candidate", []),
-                        "resolution": item.get("resolution", {}),
-                    }
-                    for item in cluster_items
-                ],
-            }
-            candidates_json = json.dumps(payload, ensure_ascii=True)
-            if "{candidates}" in user_template:
-                prompt = user_template.replace("{candidates}", candidates_json)
-            else:
-                prompt = f"{user_template}\n\nFlow candidates:\n{candidates_json}"
-            key = llm_cache.key_for(llm_model, system_prompt, prompt)
-            try:
-                parsed = chat_json_with_cache(client, llm_model, system_prompt, prompt, llm_cache, key)
-                scenarios = parsed.get("scenarios") or []
-                convo_ids = _dedupe([item.get("conversation_id", "") for item in cluster_items])
-                for scenario in scenarios:
-                    scenario.setdefault("frequency", freq)
-                    scenario.setdefault("required_inputs", [])
-                    scenario.setdefault("handover_rules", [])
-                    scenario.setdefault("example_conversation_ids", convo_ids[:5])
-                parsed.setdefault("intent_id", f"intent_{idx}")
-                parsed.setdefault(
-                    "confidence",
-                    {"score_0_to_1": 0.0, "reason": "missing_confidence_from_prompt"},
-                )
-                parsed.setdefault(
-                    "automation_suitability",
-                    {"suitable": False, "score_0_to_1": 0.0, "reason": "missing_suitability_from_prompt"},
-                )
-                parsed["scenarios"] = scenarios
-                results.append(parsed)
-                continue
-            except Exception:  # noqa: BLE001
-                pass
 
-        results.append(_fallback_intent(cluster_items, idx))
-
-    return results
+def build_intent_flow_catalogue_from_clusters(
+    flow_items: List[Dict[str, Any]],
+    clusters: List[List[int]],
+    client: OpenAI | None,
+    llm_model: str,
+    llm_cache: FileCache,
+    min_freq: int,
+    system_prompt: str,
+    user_template: str,
+    max_candidates_per_cluster: int = 25,
+) -> List[Dict[str, Any]]:
+    if not flow_items or not clusters:
+        return []
+    return _build_from_clusters(
+        flow_items,
+        clusters,
+        client,
+        llm_model,
+        llm_cache,
+        min_freq,
+        system_prompt,
+        user_template,
+        max_candidates_per_cluster,
+    )

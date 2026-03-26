@@ -22,11 +22,15 @@ def embed_texts(
     client: OpenAI | None,
     model: str,
     cache: FileCache,
+    namespace: str | None = None,
 ) -> Tuple[np.ndarray, List[str]]:
+    if client is None:
+        raise ValueError("OPENAI_API_KEY required for embeddings; fallback embeddings are disabled.")
     embeddings = []
     cache_keys = []
     for text in texts:
-        key = cache.key_for(model, "embedding", text)
+        model_key = f"{model}:{namespace}" if namespace else model
+        key = cache.key_for(model_key, "embedding", text)
         cached = cache.get(key)
         if cached is None:
             if client is None:

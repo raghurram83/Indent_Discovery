@@ -55,6 +55,7 @@ def build_faq_catalogue(
     client: OpenAI | None,
     embed_model: str,
     cache,
+    embed_namespace: str | None = None,
     threshold: float = 0.82,
     intent_catalogue: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
@@ -73,7 +74,7 @@ def build_faq_catalogue(
     if not questions:
         return []
 
-    embeddings, _ = embed_texts(questions, client, embed_model, cache)
+    embeddings, _ = embed_texts(questions, client, embed_model, cache, namespace=embed_namespace)
     clusters = split_large_clusters(cluster_embeddings(embeddings, threshold), embeddings)
 
     faq_entries: List[FAQEntry] = []

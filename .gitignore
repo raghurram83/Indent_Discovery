@@ -1,4 +1,9 @@
 workspace/
+.venv/
+.streamlit/secrets.toml
+.pytest_cache/
+.coverage
+*.log
 __pycache__/
 *.pyc
 .DS_Store
